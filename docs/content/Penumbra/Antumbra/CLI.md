@@ -48,6 +48,8 @@ antumbra --da DA.bin ufs-ffu ufs_firmware.bin
 The command streams the image to the DA and waits for its completion result. Afterward,
 reconnect the device and verify its UFS firmware version using your device's diagnostics;
 the DA result alone does not provide independent version verification.
+If the DA reports an error, `--usb-log` saves its UFS diagnostics to `da.log`. A completed
+file transfer by itself does not mean the UFS device accepted the update.
 
 ## List all partitions
 

@@ -56,6 +56,18 @@ impl DeviceLog {
         self.inner.entries.lock().map(|e| e.clone()).unwrap_or_default()
     }
 
+    /// Returns up to `limit` recent entries added at or after `start`.
+    pub fn recent_since(&self, start: usize, limit: usize) -> Vec<String> {
+        self.inner
+            .entries
+            .lock()
+            .map(|entries| {
+                let recent = &entries[start.min(entries.len())..];
+                recent[recent.len().saturating_sub(limit)..].to_vec()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn drain(&self) -> Vec<String> {
         self.inner.entries.lock().map(|mut e| std::mem::take(&mut *e)).unwrap_or_default()
     }
@@ -72,5 +84,19 @@ impl DeviceLog {
         if let Ok(mut entries) = self.inner.entries.lock() {
             entries.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_since_excludes_stale_device_messages() {
+        let log = DeviceLog::new();
+        log.push("old UFS sense".into());
+        let start = log.len();
+        log.push("current UFS sense".into());
+        assert_eq!(log.recent_since(start, 4), vec!["current UFS sense".to_string()]);
     }
 }

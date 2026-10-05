@@ -100,7 +100,7 @@ use crate::{
 const UFS_FFU_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const UFS_FFU_MAX_PACKET_LENGTH: usize = 16 * 1024 * 1024;
 
-fn check_ufs_ffu_end(resp: &str) -> Result<()> {
+fn check_ufs_ffu_end(resp: &str, da_logs: &[String]) -> Result<()> {
     let result =
         get_tag::<String>(resp, "arg/result").or_else(|_| get_tag::<String>(resp, "result"))?;
     if result.trim() == "OK" {
@@ -109,7 +109,30 @@ fn check_ufs_ffu_end(resp: &str) -> Result<()> {
 
     let message = get_tag::<String>(resp, "arg/message")
         .or_else(|_| get_tag::<String>(resp, "message"))
-        .unwrap_or_else(|_| result.clone());
+        .unwrap_or_default();
+    let message = if message.trim().is_empty() {
+        let details = da_logs
+            .iter()
+            .filter(|line| {
+                line.contains("Sense Data: ASC=")
+                    || line.contains("task response error")
+                    || line.contains("ffu fail")
+            })
+            .rev()
+            .take(3)
+            .map(|line| line.trim().replace(['\r', '\n'], " "))
+            .collect::<Vec<_>>();
+        if details.is_empty() {
+            format!("DA returned {result} without an error message; check the DA USB log")
+        } else {
+            format!(
+                "DA returned {result}; {}",
+                details.into_iter().rev().collect::<Vec<_>>().join("; ")
+            )
+        }
+    } else {
+        message
+    };
     Err(XmlErrorKind::Other(format!("UFS firmware update failed: {message}")).into())
 }
 
@@ -357,6 +380,7 @@ impl Xml {
         mut reader: R,
         mut progress: F,
     ) -> Result<()> {
+        let log_start = self.device_log.len();
         self.send_cmd(port, &UfsUpdateFirmware::new(size))?;
 
         let previous_timeout = port.get_timeout();
@@ -368,7 +392,8 @@ impl Xml {
                 let response = String::from_utf8_lossy(&resp);
 
                 if memmem::find(&resp, CMD_END).is_some() {
-                    let result = check_ufs_ffu_end(&response);
+                    let recent_logs = self.device_log.recent_since(log_start, 64);
+                    let result = check_ufs_ffu_end(&response, &recent_logs);
                     self.ack(port, None)?;
                     result?;
                     if !sent_image {
@@ -1446,8 +1471,21 @@ mod ffu_tests {
     fn accepts_only_successful_ufs_ffu_completion() {
         let ok = "<da><command>CMD:END</command><arg><result>OK</result></arg></da>";
         let rejected = "<da><command>CMD:END</command><arg><result>ERR</result><message>Bad image</message></arg></da>";
-        assert!(check_ufs_ffu_end(ok).is_ok());
-        assert!(check_ufs_ffu_end(rejected).unwrap_err().to_string().contains("Bad image"));
+        assert!(check_ufs_ffu_end(ok, &[]).is_ok());
+        assert!(check_ufs_ffu_end(rejected, &[]).unwrap_err().to_string().contains("Bad image"));
+    }
+
+    #[test]
+    fn empty_da_message_includes_current_ufs_sense() {
+        let rejected = "<host><command>CMD:END</command><arg><result>ERR</result><message></message></arg></host>";
+        let logs = [
+            "[UFS] Sense Data: ASC=24, ASCQ=0".to_string(),
+            "[UFS] err: task response error = 1".to_string(),
+            "[UFS] ffu fail, fw size=442368".to_string(),
+        ];
+        let error = check_ufs_ffu_end(rejected, &logs).unwrap_err().to_string();
+        assert!(error.contains("ASC=24, ASCQ=0"));
+        assert!(error.contains("ffu fail, fw size=442368"));
     }
 
     #[test]
