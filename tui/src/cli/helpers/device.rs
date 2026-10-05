@@ -6,7 +6,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use log::info;
 use penumbra::port::{ConnectionType, PortType};
 use penumbra::{DevInfoData, Device, DeviceBuilder, MMIO, MtkPort, SoC};
@@ -25,6 +25,10 @@ pub fn setup_device<'a>(
     pl_data: Option<&'a [u8]>,
     auth_data: Option<&'a [u8]>,
 ) -> Result<Device<'a, PortType>> {
+    if args.mi_auth && auth_data.is_none() {
+        bail!("--mi-auth requires a matching --auth file before requesting the one-time challenge");
+    }
+
     let usb_log_channel = state.usb_log || args.usb_log;
 
     let mut last_seen = Instant::now();
@@ -33,8 +37,14 @@ pub fn setup_device<'a>(
     info!("Waiting for MTK device...");
     let mtk_port = loop {
         if let Ok(Some(mut port)) = PortType::find_and_open(args.vid, args.pid, args.backend) {
-            if state.flash_mode != 0 {
+            if state.flash_mode != 0 && !args.mi_auth {
                 port.set_connection_type(ConnectionType::Da)?;
+            }
+
+            if args.mi_auth && port.connection_type() != ConnectionType::Brom {
+                bail!(
+                    "--mi-auth requires a fresh BROM connection (normally USB 0E8D:0003); reconnect the device in BROM mode"
+                );
             }
 
             info!("Found MTK port: {}", port.get_port_name());
@@ -49,7 +59,8 @@ pub fn setup_device<'a>(
 
     let mut builder = DeviceBuilder::new(mtk_port)
         .with_log_level(args.da_log_level)
-        .with_usb_log_channel(usb_log_channel);
+        .with_usb_log_channel(usb_log_channel)
+        .require_brom_sla(args.mi_auth);
 
     if usb_log_channel && let Some(device_log) = setup_file_logger(DA_LOG_FILE) {
         builder = builder.with_device_log(device_log);
@@ -61,7 +72,7 @@ pub fn setup_device<'a>(
 
     let mut dev = builder.build()?;
 
-    if state.hw_code != 0 {
+    if state.hw_code != 0 && !args.mi_auth {
         let chip = SoC::try_from_hwcode(state.hw_code);
         let dev_info = DevInfoData {
             soc_id: state.soc_id,
@@ -76,6 +87,11 @@ pub fn setup_device<'a>(
 
         dev.reinit(dev_info)?;
     } else {
+        if args.mi_auth && state.hw_code != 0 {
+            info!(
+                "--mi-auth was requested; ignoring the cached DA session and requesting a fresh one-time challenge"
+            );
+        }
         info!("Initializing device...");
         dev.init()?;
 

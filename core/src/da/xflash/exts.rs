@@ -25,6 +25,26 @@ const DA_EXT: &[u8] = include_bytes!("../../../payloads/da_x.bin");
 // Won't go faster, and bigger packets makes the device hang
 const RPMB_WRITE_PKT_LEN: usize = 32 * 1024;
 const POINTER_TABLE_MAGIC: u32 = 0x54525450;
+const MAX_RPMB_TRANSFER_SECTORS: u32 = u32::MAX / RPMB_FRAME_DATA_SZ as u32;
+
+fn checked_rpmb_data_len(start_sector: u32, num_sectors: u32, rpmb_size: u64) -> Result<usize> {
+    if num_sectors == 0 || num_sectors > MAX_RPMB_TRANSFER_SECTORS {
+        return Err(PenumbraError::RpmbSectorOutOfBounds.into());
+    }
+
+    let end = start_sector.checked_add(num_sectors).ok_or(PenumbraError::RpmbSectorOutOfBounds)?;
+    if rpmb_size != 0 {
+        let max_sectors = u32::try_from(rpmb_size / RPMB_FRAME_DATA_SZ as u64)
+            .map_err(|_| PenumbraError::RpmbSectorOutOfBounds)?;
+        if end > max_sectors {
+            return Err(PenumbraError::RpmbSectorOutOfBounds.into());
+        }
+    }
+
+    (num_sectors as usize)
+        .checked_mul(RPMB_FRAME_DATA_SZ)
+        .ok_or_else(|| PenumbraError::RpmbSectorOutOfBounds.into())
+}
 
 pub fn boot_extensions<P: MtkPort>(
     xflash: &mut XFlash,
@@ -252,19 +272,18 @@ pub(super) fn read_rpmb<W: Writer, F: ProgressCallback, P: MtkPort>(
     writer: W,
     progress: F,
 ) -> Result<()> {
-    init_rpmb(xflash, port, region)?;
-
     let storage = xflash.get_storage(port).ok_or(ProtocolError::CannotGetStorageInfo)?;
 
     let rpmb_size = storage.get_rpmb_size();
-    let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
-    if start_sector.checked_add(num_sectors).is_none_or(|end| end > max_sectors) {
-        return Err(PenumbraError::RpmbSectorOutOfBounds.into());
+    let data_len = checked_rpmb_data_len(start_sector, num_sectors, rpmb_size)?;
+    if rpmb_size == 0 {
+        info!("Device reports unknown RPMB size; skipping RPMB bounds check");
     }
+
+    init_rpmb(xflash, port, region)?;
 
     let params = RpmbParams { start_sector, sectors_count: num_sectors }.to_bytes();
     let region = (region as u32).to_le_bytes();
-    let data_len = num_sectors as usize * RPMB_FRAME_DATA_SZ;
 
     xflash.devctrl(port, Cmd::ExtRpmbRead, Some(&[&region, &params]))?;
     xflash.upload_data(port, data_len, writer, progress)?;
@@ -282,19 +301,22 @@ pub(super) fn write_rpmb<R: Reader, F: ProgressCallback, P: MtkPort>(
     reader: R,
     progress: F,
 ) -> Result<()> {
-    init_rpmb(xflash, port, region)?;
-
     let storage = xflash.get_storage(port).ok_or(ProtocolError::CannotGetStorageInfo)?;
 
     let rpmb_size = storage.get_rpmb_size();
-    let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
-    if start_sector.checked_add(num_sectors).is_none_or(|end| end > max_sectors) {
-        return Err(PenumbraError::RpmbSectorOutOfBounds.into());
+    let data_len = checked_rpmb_data_len(start_sector, num_sectors, rpmb_size)?;
+    if rpmb_size == 0 {
+        info!("Device reports unknown RPMB size; skipping RPMB bounds check");
+    }
+
+    if xflash.rpmb_authenticated_regions & (1 << (region as u8)) == 0 {
+        init_rpmb(xflash, port, region)?;
+    } else {
+        info!("Using the already authenticated RPMB key for RPMB write");
     }
 
     let params = RpmbParams { start_sector, sectors_count: num_sectors }.to_bytes();
     let region = (region as u32).to_le_bytes();
-    let data_len = num_sectors as usize * RPMB_FRAME_DATA_SZ;
 
     xflash.devctrl(port, Cmd::ExtRpmbWrite, Some(&[&region, &params]))?;
     xflash.download_data_with(port, data_len, RPMB_WRITE_PKT_LEN, MAX_TIMEOUT, reader, progress)?;
@@ -324,8 +346,13 @@ pub(super) fn auth_rpmb<P: MtkPort>(
     region: RpmbRegion,
     key: &[u8],
 ) -> Result<()> {
+    if key.len() != 32 {
+        return Err(PenumbraError::InvalidRpmbKeyLength.into());
+    }
+
     xflash.devctrl(port, Cmd::ExtRpmbInit, Some(&[&(region as u32).to_le_bytes(), key]))?;
     status_ok!(xflash, port)?;
+    xflash.rpmb_authenticated_regions |= 1 << (region as u8);
 
     Ok(())
 }

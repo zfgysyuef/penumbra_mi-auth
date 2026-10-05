@@ -37,11 +37,17 @@ fn main() -> Result<()> {
     #[cfg(not(all(windows, feature = "tui")))]
     let tui = args.tui;
 
+    if tui && args.mi_auth {
+        anyhow::bail!(
+            "--mi-auth currently requires CLI mode because SIGN entry uses the terminal standard input"
+        );
+    }
+
     init_logger(tui, args.verbose);
 
     let config = AntumbraConfig::load()?;
 
-    init_auth(config.clone())?;
+    init_auth(config.clone(), args.mi_auth, args.auth_file.as_deref())?;
 
     if !tui || !cfg!(feature = "tui") {
         return run_cli(&args, &config);

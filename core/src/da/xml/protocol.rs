@@ -96,6 +96,7 @@ use crate::{
 
 pub struct Xml {
     pub(super) write_packed_length: Option<usize>,
+    pub(super) rpmb_authenticated_regions: u8,
     #[cfg(feature = "exploits")]
     pub(super) patched: bool,
     devinfo: DevInfo,
@@ -110,6 +111,7 @@ impl Xml {
     pub fn new(params: DaProtocolParams<'_>) -> Self {
         Self {
             write_packed_length: None,
+            rpmb_authenticated_regions: 0,
             #[cfg(feature = "exploits")]
             patched: false,
             devinfo: params.devinfo,
@@ -1185,6 +1187,14 @@ impl DownloadProtocolExt for Xml {
         key: &[u8],
     ) -> Result<()> {
         exts::auth_rpmb(self, port, region, key)
+    }
+
+    fn get_rpmb_region_info<P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        region: crate::storage::RpmbRegion,
+    ) -> Result<(bool, u32)> {
+        exts::get_rpmb_region_info(self, port, region)
     }
 
     fn sej_aes<R: Reader, W: Writer, P: MtkPort>(

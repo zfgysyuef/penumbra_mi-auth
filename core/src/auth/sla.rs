@@ -83,6 +83,13 @@ impl AuthManager {
         Ok(())
     }
 
+    /// Registers a signer ahead of existing and default signers.
+    pub fn register_signer_first(&self, signer: Arc<dyn Signer>) -> Result<()> {
+        self.signers.write().unwrap().insert(0, signer);
+
+        Ok(())
+    }
+
     /// Return whether any of the registered signers can sign the given request.
     pub fn can_sign(&self, pubk: &[u8]) -> bool {
         let Ok(signers) = self.signers.read() else {

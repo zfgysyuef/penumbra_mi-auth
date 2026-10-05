@@ -360,6 +360,13 @@ pub trait DownloadProtocolExt {
     fn auth_rpmb<P: MtkPort>(&mut self, port: &mut P, region: RpmbRegion, key: &[u8])
     -> Result<()>;
 
+    /// Returns whether an RPMB region is enabled and its 256-byte sector count.
+    fn get_rpmb_region_info<P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        region: RpmbRegion,
+    ) -> Result<(bool, u32)>;
+
     /* Crypto */
 
     /* Encrypts / Decrypts, based on params, the given data in reader and writes the result to

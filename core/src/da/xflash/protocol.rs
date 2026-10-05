@@ -57,6 +57,7 @@ pub struct XFlash<'a> {
     pub pl: Option<Preloader<'a>>,
     pub(super) read_packet_length: Option<usize>,
     pub(super) write_packet_length: Option<usize>,
+    pub(super) rpmb_authenticated_regions: u8,
     #[cfg(feature = "exploits")]
     pub(super) patched: bool,
     devinfo: DevInfo,
@@ -81,6 +82,7 @@ impl<'a> XFlash<'a> {
             activity: params.activity,
             read_packet_length: None,
             write_packet_length: None,
+            rpmb_authenticated_regions: 0,
             storage: None,
             #[cfg(feature = "exploits")]
             patched: false,
@@ -1075,6 +1077,21 @@ impl<'a> DownloadProtocolExt for XFlash<'a> {
         key: &[u8],
     ) -> Result<()> {
         exts::auth_rpmb(self, port, region, key)
+    }
+
+    fn get_rpmb_region_info<P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        region: crate::storage::RpmbRegion,
+    ) -> Result<(bool, u32)> {
+        if region != crate::storage::RpmbRegion::R0 {
+            return Ok((false, 0));
+        }
+
+        let size = self.get_storage(port).map_or(0, Storage::get_rpmb_size);
+        let sectors = u32::try_from(size / crate::storage::RPMB_FRAME_DATA_SZ as u64)
+            .map_err(|_| PenumbraError::RpmbSectorOutOfBounds)?;
+        Ok((sectors != 0, sectors))
     }
 
     fn sej_aes<R: Reader, W: Writer, P: MtkPort>(

@@ -144,6 +144,8 @@ pub enum PenumbraError {
     BufferTooSmall,
     #[error("Invalid auth file")]
     InvalidAuthFile,
+    #[error("A fresh BROM connection is required for the requested SLA challenge")]
+    BromSlaRequired,
     #[error("DA Protocol not initialized")]
     ProtocolNotInitialized,
     #[error("Unsupported device")]
@@ -174,6 +176,8 @@ pub enum PenumbraError {
     UnsupportedStorage,
     #[error("Invalid RPMB region")]
     InvalidRpmbRegion,
+    #[error("RPMB key must be exactly 32 bytes")]
+    InvalidRpmbKeyLength,
     #[error("RPMB sector out of bounds")]
     RpmbSectorOutOfBounds,
     #[error("Patch exceeds data bounds")]

@@ -17,6 +17,7 @@ pub struct PlProtocol<'a, P: MtkPort> {
 }
 
 impl<'a, P: MtkPort> PlProtocol<'a, P> {
+    const MAX_SLA_CHALLENGE_LEN: usize = 0x1000;
     const SEQ: [u8; 4] = [0xA0, 0x0A, 0x50, 0x05];
 
     pub const fn new(port: &'a mut P) -> Self {
@@ -358,18 +359,34 @@ impl<'a, P: MtkPort> PlProtocol<'a, P> {
     }
 
     pub fn sla_challenge(&mut self, pubk_mod: &[u8]) -> Result<()> {
+        self.sla_challenge_inner(pubk_mod, true)
+    }
+
+    /// Performs SLA without an additional SoC ID request for one-time BROM challenges.
+    pub fn sla_challenge_raw(&mut self, pubk_mod: &[u8]) -> Result<()> {
+        self.sla_challenge_inner(pubk_mod, false)
+    }
+
+    fn sla_challenge_inner(&mut self, pubk_mod: &[u8], include_soc_id: bool) -> Result<()> {
         let auth = AuthManager::get();
         if !auth.can_sign(pubk_mod) {
             return Err(AuthError::NoSignerAvailable.into());
         }
 
-        let soc_id = self.get_soc_id().unwrap_or_default().to_vec();
+        let soc_id = if include_soc_id {
+            self.get_soc_id().unwrap_or_default().to_vec()
+        } else {
+            Vec::new()
+        };
 
         self.echo(&[Command::SlaChallenge as u8], 1)?;
 
         status_ok!(self);
 
         let length = self.read_u32_be()? as usize;
+        if length == 0 || length > Self::MAX_SLA_CHALLENGE_LEN {
+            return Err(ProtocolError::InvalidResponseLength.into());
+        }
         let mut buffer = vec![0u8; length];
         self.read(&mut buffer)?;
 

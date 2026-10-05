@@ -112,6 +112,9 @@ pub struct CliArgs {
     /// Enable USB DA logging
     #[arg(long = "usb-log", global = true, help_heading = "Device & Connection Options")]
     pub usb_log: bool,
+    /// Complete Xiaomi BROM authentication with an externally signed one-time BLOB.
+    #[arg(long = "mi-auth", global = true, help_heading = "Device & Connection Options")]
+    pub mi_auth: bool,
     /// Subcommands for CLI mode. If provided, TUI mode will be disabled.
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -175,4 +178,35 @@ pub fn run_cli(args: &CliArgs, _config: &AntumbraConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+    use crate::cli::commands::device::rpmb::RpmbCommand;
+
+    #[test]
+    fn parses_mi_auth_before_or_after_rpmb_subcommand() {
+        let before = CliArgs::try_parse_from(["antumbra", "--mi-auth", "rpmb", "info"]).unwrap();
+        let after = CliArgs::try_parse_from(["antumbra", "rpmb", "info", "--mi-auth"]).unwrap();
+
+        assert!(before.mi_auth);
+        assert!(after.mi_auth);
+        assert!(matches!(after.command, Some(Commands::Rpmb(_))));
+    }
+
+    #[test]
+    fn parses_top_level_rpmb_verify_derived() {
+        let args = CliArgs::try_parse_from(["antumbra", "rpmb", "verify-derived", "--region", "1"])
+            .unwrap();
+        let Some(Commands::Rpmb(rpmb)) = args.command else {
+            panic!("expected RPMB command");
+        };
+        let RpmbCommand::VerifyDerived(verify) = rpmb.command else {
+            panic!("expected verify-derived command");
+        };
+        assert_eq!(verify.region, 1);
+    }
 }

@@ -27,9 +27,9 @@ use crate::error::{ConnectionError, PenumbraError};
 use crate::log_buffer::DeviceLog;
 use crate::port::{ConnectionType, MtkPort};
 use crate::preloader::PlProtocol;
-use crate::storage::PartitionKind;
+use crate::storage::{PartitionKind, Storage};
 use crate::traits::{ProgressCallback, Reader, ReaderSource, Writer, WriterSink};
-use crate::{Error, Partition, Result, StorageKind};
+use crate::{Error, Partition, Result, StorageKind, StorageType};
 
 /// A builder for creating a new [`Device`].
 ///
@@ -70,6 +70,8 @@ pub struct DeviceBuilder<'a, P: MtkPort> {
     /// If the device has DAA enabled and is in BROM mode, this data will be
     /// sent during initialization to be able to load the DA.
     auth_data: Option<&'a [u8]>,
+    /// Whether failure of BROM SLA must abort initialization.
+    require_brom_sla: bool,
     /// Whether to enable verbose logging.
     da_log_level: DaLogLevel,
     /// Whether to use USB as the DA log channel instead of UART.
@@ -90,6 +92,7 @@ impl<'a, P: MtkPort> DeviceBuilder<'a, P> {
             da_data: None,
             preloader_data: None,
             auth_data: None,
+            require_brom_sla: false,
             da_log_level: DaLogLevel::Info,
             usb_log_channel: false,
             device_log: None,
@@ -112,6 +115,12 @@ impl<'a, P: MtkPort> DeviceBuilder<'a, P> {
     /// Assigns the authentication data for DAA enabled devices.
     pub const fn with_auth(mut self, data: &'a [u8]) -> Self {
         self.auth_data = Some(data);
+        self
+    }
+
+    /// Makes BROM SLA failure fatal during initialization.
+    pub const fn require_brom_sla(mut self, required: bool) -> Self {
+        self.require_brom_sla = required;
         self
     }
 
@@ -163,6 +172,7 @@ impl<'a, P: MtkPort> DeviceBuilder<'a, P> {
             protocol: None,
             connected: false,
             auth_data: self.auth_data,
+            require_brom_sla: self.require_brom_sla,
             usb_log_channel: self.usb_log_channel,
             device_log,
             activity: self.activity.unwrap_or_default(),
@@ -175,6 +185,7 @@ pub struct Device<'a, P: MtkPort> {
     da: Option<Da<'a>>,
     pl: Option<Preloader<'a>>,
     auth_data: Option<&'a [u8]>,
+    require_brom_sla: bool,
     devinfo: DevInfo,
     da_log_level: DaLogLevel,
     usb_log_channel: bool,
@@ -185,6 +196,14 @@ pub struct Device<'a, P: MtkPort> {
 }
 
 impl<'a, P: MtkPort> Device<'a, P> {
+    fn ensure_rpmb_region_supported(&mut self, region: crate::storage::RpmbRegion) -> Result<()> {
+        let storage = self.get_storage().ok_or(PenumbraError::UnsupportedStorage)?;
+        if storage.kind() != StorageType::Ufs && region != crate::storage::RpmbRegion::R0 {
+            return Err(PenumbraError::InvalidRpmbRegion.into());
+        }
+        Ok(())
+    }
+
     /// Initializes the device by performing the initial handshake with Preloader/BROM and
     /// retrieving device information.
     ///
@@ -218,6 +237,15 @@ impl<'a, P: MtkPort> Device<'a, P> {
     /// ```
     pub fn init(&mut self) -> Result<()> {
         let conn_type = self.port().connection_type();
+        let require_brom_sla = self.require_brom_sla;
+
+        if require_brom_sla && conn_type != ConnectionType::Brom {
+            return Err(PenumbraError::BromSlaRequired.into());
+        }
+        if require_brom_sla && self.auth_data.is_none() {
+            return Err(PenumbraError::InvalidAuthFile.into());
+        }
+
         let mut pl = PlProtocol::new(&mut self.port);
 
         pl.handshake()?;
@@ -275,10 +303,14 @@ impl<'a, P: MtkPort> Device<'a, P> {
                 // If we have exploits enabled, we can ignore the result of the SLA challenge since
                 // we can bypass it in some cases, and if the latter fails, we can't continue
                 // anyway and we'll get an error about SLA during DA upload.
-                #[cfg(feature = "exploits")]
-                pl.sla_challenge(sla_pubk).ok();
-                #[cfg(not(feature = "exploits"))]
-                pl.sla_challenge(sla_pubk)?;
+                if require_brom_sla {
+                    pl.sla_challenge_raw(sla_pubk)?;
+                } else {
+                    #[cfg(feature = "exploits")]
+                    pl.sla_challenge(sla_pubk).ok();
+                    #[cfg(not(feature = "exploits"))]
+                    pl.sla_challenge(sla_pubk)?;
+                }
             }
         }
 
@@ -1379,6 +1411,7 @@ impl<'a, P: MtkPort> Device<'a, P> {
         F: ProgressCallback,
     {
         self.ensure_da_mode()?;
+        self.ensure_rpmb_region_supported(region)?;
 
         let protocol = self.protocol.as_mut().unwrap();
         protocol.read_rpmb(&mut self.port, region, start_sector, sectors_count, writer, progress)
@@ -1415,6 +1448,7 @@ impl<'a, P: MtkPort> Device<'a, P> {
         F: ProgressCallback,
     {
         self.ensure_da_mode()?;
+        self.ensure_rpmb_region_supported(region)?;
 
         let protocol = self.protocol.as_mut().unwrap();
         protocol.write_rpmb(&mut self.port, region, start_sector, sectors_count, reader, progress)
@@ -1448,6 +1482,7 @@ impl<'a, P: MtkPort> Device<'a, P> {
         F: ProgressCallback,
     {
         self.ensure_da_mode()?;
+        self.ensure_rpmb_region_supported(region)?;
 
         let protocol = self.protocol.as_mut().unwrap();
         protocol.erase_rpmb(&mut self.port, region, start_sector, sectors_count, progress)
@@ -1455,10 +1490,8 @@ impl<'a, P: MtkPort> Device<'a, P> {
 
     /// Authenticates the RPMB region with the provided key.
     /// The device must be in DA mode and exploitable for this operation to succeed.
-    /// If the key is incorrect, subsequent RPMB operations will fail.
-    /// If the key has already been set, this will suceed regardless of the input.
-    /// If `read_rpmb` or `write_rpmb` already authenticated the derived key from the crypto engine,
-    /// this will also succeed regardless of the input.
+    /// The key is validated against an authenticated RPMB response. A mismatched key returns an
+    /// error before subsequent RPMB operations are attempted.
     ///
     /// Each RPMB region has its own key, so you must authenticate each region separately.
     /// On EMMC, the region will always default to R0.
@@ -1478,9 +1511,22 @@ impl<'a, P: MtkPort> Device<'a, P> {
     /// ```
     pub fn auth_rpmb(&mut self, region: crate::storage::RpmbRegion, key: &[u8]) -> Result<()> {
         self.ensure_da_mode()?;
+        self.ensure_rpmb_region_supported(region)?;
 
         let protocol = self.protocol.as_mut().unwrap();
         protocol.auth_rpmb(&mut self.port, region, key)
+    }
+
+    /// Returns whether an RPMB region is enabled and its 256-byte sector count.
+    pub fn get_rpmb_region_info(
+        &mut self,
+        region: crate::storage::RpmbRegion,
+    ) -> Result<(bool, u32)> {
+        self.ensure_da_mode()?;
+        self.ensure_rpmb_region_supported(region)?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.get_rpmb_region_info(&mut self.port, region)
     }
 
     /// Performs AES crypto operations with the device's crypto engine "SEJ"

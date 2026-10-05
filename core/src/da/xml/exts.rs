@@ -23,6 +23,7 @@ use crate::utils::xml::{get_tag, get_tag_usize};
 
 const DA_EXT: &[u8] = include_bytes!("../../../payloads/da_xml.bin");
 const POINTER_TABLE_MAGIC: u32 = 0x54525450;
+const MAX_RPMB_TRANSFER_SECTORS: u32 = u32::MAX / RPMB_FRAME_DATA_SZ as u32;
 
 #[derive(SchemaWrite, ToBytes)]
 #[repr(C)]
@@ -35,6 +36,12 @@ struct ExtPointerTable {
     malloc: u32,
     free: u32,
     mmc_get_card: u32,
+    ufs_get_lu: u32,
+    ufs_get_tag: u32,
+    ufs_queuecommand: u32,
+    ufs_put_tag: u32,
+    da_key_derive: u32,
+    ufs_read_desc: u32,
 }
 
 #[derive(XmlCommand)]
@@ -142,6 +149,12 @@ pub struct ExtRpmbWrite {
     start_sector: u32,
     #[xml(tag = "sectors_count", fmt = "{sectors_count}")]
     sectors_count: u32,
+}
+
+#[derive(XmlCommand)]
+pub struct ExtRpmbInfo {
+    #[xml(tag = "partition", fmt = "{partition}")]
+    partition: u32,
 }
 
 pub fn boot_extensions<P: MtkPort>(xml: &mut Xml, port: &mut P, da: &DaEntry<'_>) -> Result<bool> {
@@ -259,6 +272,36 @@ fn prepare_extensions(da: &DaEntry<'_>, chip: SoC) -> Option<Vec<u8>> {
 
     debug!("clear_err_msg function at VA 0x{:X}", clear_err_msg);
 
+    let (ufs_get_lu, ufs_get_tag, ufs_queuecommand, ufs_put_tag) = if is_arm64 {
+        (0, 0, 0, 0)
+    } else {
+        find_ufs_rpmb_helpers(&analyzer).unwrap_or((0, 0, 0, 0))
+    };
+
+    if ufs_get_lu != 0 && ufs_get_tag != 0 && ufs_queuecommand != 0 && ufs_put_tag != 0 {
+        debug!(
+            "UFS RPMB helpers at get_lu=0x{:X}, get_tag=0x{:X}, queuecommand=0x{:X}, put_tag=0x{:X}",
+            ufs_get_lu, ufs_get_tag, ufs_queuecommand, ufs_put_tag
+        );
+    } else {
+        debug!("Could not locate UFS RPMB helper functions");
+    }
+
+    let da_key_derive =
+        if is_arm64 { 0 } else { find_native_da_key_derive(&analyzer).unwrap_or(0) };
+    if da_key_derive != 0 {
+        info!("Using native DA key derivation helper at 0x{da_key_derive:08X}");
+    } else {
+        debug!("Could not locate native DA key derivation helper");
+    }
+
+    let ufs_read_desc = if is_arm64 { 0 } else { find_ufs_read_desc(&analyzer).unwrap_or(0) };
+    if ufs_read_desc != 0 {
+        info!("Using native UFS descriptor reader at 0x{ufs_read_desc:08X}");
+    } else {
+        debug!("Could not locate native UFS descriptor query helper");
+    }
+
     let uart_base = chip.uart0();
 
     debug!("UART base address at 0x{:X}", uart_base);
@@ -272,6 +315,12 @@ fn prepare_extensions(da: &DaEntry<'_>, chip: SoC) -> Option<Vec<u8>> {
         malloc: malloc_addr,
         free: free_addr,
         mmc_get_card,
+        ufs_get_lu,
+        ufs_get_tag,
+        ufs_queuecommand,
+        ufs_put_tag,
+        da_key_derive,
+        ufs_read_desc,
     };
 
     let off = da_ext_data.len() - ExtPointerTable::SIZE;
@@ -279,6 +328,61 @@ fn prepare_extensions(da: &DaEntry<'_>, chip: SoC) -> Option<Vec<u8>> {
     da_ext_data[off..off + ExtPointerTable::SIZE].copy_from_slice(&table.to_bytes());
 
     Some(da_ext_data)
+}
+
+fn find_ufs_rpmb_helpers(analyzer: &Analyzer) -> Option<(u32, u32, u32, u32)> {
+    let read_counter_off = analyzer.fn_from_str("rpmb_authen_read_counter")?;
+
+    let get_lu_bl = analyzer.next_bl_from_off(read_counter_off)?;
+    let ufs_get_lu = analyzer.bl_target(get_lu_bl)? as u32;
+
+    let get_tag_bl = analyzer.next_bl_from_off(get_lu_bl + 4)?;
+    let ufs_get_tag = analyzer.bl_target(get_tag_bl)? as u32;
+
+    // ARM32 layout observed in MT6895-family DAs.
+    let ufs_queuecommand = analyzer.bl_target(read_counter_off + 0x150)? as u32;
+    let ufs_put_tag = analyzer.bl_target(read_counter_off + 0x2D4)? as u32;
+
+    Some((ufs_get_lu, ufs_get_tag, ufs_queuecommand, ufs_put_tag))
+}
+
+fn find_native_da_key_derive(analyzer: &Analyzer) -> Option<u32> {
+    let offset = analyzer.fn_from_str("key_derive fails")?;
+
+    // Guard the string match with the ARM32 prologue used by the native
+    // three-argument wrapper in the MT6895 DA.
+    let expected = [0xE92D_48F0, 0xE28D_B010, 0xE24D_D030];
+    for (index, instruction) in expected.into_iter().enumerate() {
+        if analyzer.read_u32(offset + index * 4)? != instruction {
+            return None;
+        }
+    }
+
+    let address = analyzer.off_to_va(offset)?;
+    if address > u32::MAX as u64 || address & 3 != 0 {
+        return None;
+    }
+
+    Some(address as u32)
+}
+
+fn find_ufs_read_desc(analyzer: &Analyzer) -> Option<u32> {
+    let offset =
+        analyzer.fn_from_str("[UFS] failed reading descriptor. desc_id %d desc_len %d ret %d")?;
+
+    let expected = [0xE92D_48F0, 0xE28D_B010, 0xE24D_D010, 0xE1A0_4001];
+    for (index, instruction) in expected.into_iter().enumerate() {
+        if analyzer.read_u32(offset + index * 4)? != instruction {
+            return None;
+        }
+    }
+
+    let address = analyzer.off_to_va(offset)?;
+    if address > u32::MAX as u64 || address & 3 != 0 {
+        return None;
+    }
+
+    Some(address as u32)
 }
 
 pub(super) fn peek<W: Writer, F: ProgressCallback, P: MtkPort>(
@@ -407,7 +511,91 @@ fn init_rpmb<P: MtkPort>(xml: &mut Xml, port: &mut P, region: RpmbRegion) -> Res
 
     // If the RPMB is already initialized (even with another key), this will succeed
     // without actually changing the key.
-    xmlcmd_e!(xml, port, ExtRpmbInit, region as u32, hex::encode(&key))
+    xmlcmd_e!(xml, port, ExtRpmbInit, region as u32, hex::encode(&key))?;
+    xml.rpmb_authenticated_regions |= 1 << (region as u8);
+    Ok(())
+}
+
+fn storage_sector_count(rpmb_size: u64) -> Result<Option<u32>> {
+    if rpmb_size == 0 {
+        return Ok(None);
+    }
+
+    let sectors = u32::try_from(rpmb_size / RPMB_FRAME_DATA_SZ as u64)
+        .map_err(|_| PenumbraError::RpmbSectorOutOfBounds)?;
+    Ok(Some(sectors))
+}
+
+fn checked_rpmb_data_len(
+    start_sector: u32,
+    num_sectors: u32,
+    max_sectors: Option<u32>,
+) -> Result<usize> {
+    if num_sectors == 0 || num_sectors > MAX_RPMB_TRANSFER_SECTORS {
+        return Err(PenumbraError::RpmbSectorOutOfBounds.into());
+    }
+
+    let end = start_sector.checked_add(num_sectors).ok_or(PenumbraError::RpmbSectorOutOfBounds)?;
+    if max_sectors.is_some_and(|max| end > max) {
+        return Err(PenumbraError::RpmbSectorOutOfBounds.into());
+    }
+
+    (num_sectors as usize)
+        .checked_mul(RPMB_FRAME_DATA_SZ)
+        .ok_or_else(|| PenumbraError::RpmbSectorOutOfBounds.into())
+}
+
+fn rpmb_max_sectors<P: MtkPort>(
+    xml: &mut Xml,
+    port: &mut P,
+    region: RpmbRegion,
+    storage_type: crate::storage::StorageType,
+    global_rpmb_size: u64,
+) -> Result<Option<u32>> {
+    let global = storage_sector_count(global_rpmb_size)?;
+    if storage_type != crate::storage::StorageType::Ufs {
+        return Ok(global);
+    }
+
+    match get_rpmb_region_info(xml, port, region) {
+        Ok((_, sectors)) if sectors != 0 => Ok(Some(sectors)),
+        Ok(_) if region == RpmbRegion::R0 => Ok(global),
+        Ok(_) => Ok(Some(0)),
+        Err(error) => {
+            warn!("Failed to retrieve RPMB region {} capacity: {error}", region as u32);
+            if region == RpmbRegion::R0 { Ok(global) } else { Err(error) }
+        }
+    }
+}
+
+pub(super) fn get_rpmb_region_info<P: MtkPort>(
+    xml: &mut Xml,
+    port: &mut P,
+    region: RpmbRegion,
+) -> Result<(bool, u32)> {
+    let Some(storage) = xml.get_storage(port) else {
+        return Err(ProtocolError::CannotGetStorageInfo.into());
+    };
+    let storage_type = storage.kind();
+    let rpmb_size = storage.get_rpmb_size();
+
+    if storage_type != crate::storage::StorageType::Ufs {
+        if region != RpmbRegion::R0 {
+            return Ok((false, 0));
+        }
+
+        let sectors = storage_sector_count(rpmb_size)?.unwrap_or(0);
+        return Ok((sectors != 0, sectors));
+    }
+
+    xmlcmd!(xml, port, ExtRpmbInfo, region as u32)?;
+    let response = xml.get_upload_file_resp(port);
+    xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)?;
+
+    let response = response?;
+    let enabled = get_tag::<String>(&response, "enabled")? == "yes";
+    let sectors = get_tag::<u32>(&response, "sector_count")?;
+    Ok((enabled, sectors))
 }
 
 pub(super) fn read_rpmb<W: Writer, F: ProgressCallback, P: MtkPort>(
@@ -419,20 +607,31 @@ pub(super) fn read_rpmb<W: Writer, F: ProgressCallback, P: MtkPort>(
     writer: W,
     progress: F,
 ) -> Result<()> {
-    init_rpmb(xml, port, region)?;
-
     let Some(storage) = xml.get_storage(port) else {
         return Err(ProtocolError::CannotGetStorageInfo.into());
     };
 
+    let storage_type = storage.kind();
     let rpmb_size = storage.get_rpmb_size();
-    let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
-    if start_sector.checked_add(num_sectors).is_none_or(|end| end > max_sectors) {
-        return Err(PenumbraError::RpmbSectorOutOfBounds.into());
-    };
+    if storage_type == crate::storage::StorageType::Ufs {
+        info!("Skipping RPMB key derivation/init for UFS RPMB read");
+    } else if xml.rpmb_authenticated_regions & (1 << (region as u8)) != 0 {
+        info!("Using the already authenticated RPMB key for RPMB read");
+    } else {
+        init_rpmb(xml, port, region)?;
+    }
+
+    let max_sectors = rpmb_max_sectors(xml, port, region, storage_type, rpmb_size)?;
+    let data_len = checked_rpmb_data_len(start_sector, num_sectors, max_sectors)?;
+    if max_sectors.is_none() {
+        info!("Device reports unknown RPMB size; skipping RPMB bounds check");
+    }
 
     xmlcmd!(xml, port, ExtRpmbRead, region as u32, start_sector, num_sectors)?;
-    xml.upload_data(port, num_sectors as usize * RPMB_FRAME_DATA_SZ, writer, progress)?;
+    if let Err(error) = xml.upload_data(port, data_len, writer, progress) {
+        let _ = xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd);
+        return Err(error);
+    }
     xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)
 }
 
@@ -445,22 +644,29 @@ pub(super) fn write_rpmb<R: Reader, F: ProgressCallback, P: MtkPort>(
     reader: R,
     progress: F,
 ) -> Result<()> {
-    init_rpmb(xml, port, region)?;
-
     let Some(storage) = xml.get_storage(port) else {
         return Err(ProtocolError::CannotGetStorageInfo.into());
     };
 
+    let storage_type = storage.kind();
     let rpmb_size = storage.get_rpmb_size();
-    let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
-    if start_sector.checked_add(num_sectors).is_none_or(|end| end > max_sectors) {
-        return Err(PenumbraError::RpmbSectorOutOfBounds.into());
-    };
+    if xml.rpmb_authenticated_regions & (1 << (region as u8)) != 0 {
+        info!("Using the already authenticated RPMB key for RPMB write");
+    } else {
+        init_rpmb(xml, port, region)?;
+    }
 
-    let data_len = num_sectors as usize * RPMB_FRAME_DATA_SZ;
+    let max_sectors = rpmb_max_sectors(xml, port, region, storage_type, rpmb_size)?;
+    let data_len = checked_rpmb_data_len(start_sector, num_sectors, max_sectors)?;
+    if max_sectors.is_none() {
+        info!("Device reports unknown RPMB size; skipping RPMB bounds check");
+    }
 
     xmlcmd!(xml, port, ExtRpmbWrite, region as u32, start_sector, num_sectors)?;
-    xml.download_data(port, data_len, reader, progress)?;
+    if let Err(error) = xml.download_data(port, data_len, reader, progress) {
+        let _ = xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd);
+        return Err(error);
+    }
     xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)
 }
 
@@ -485,6 +691,12 @@ pub(super) fn auth_rpmb<P: MtkPort>(
     region: RpmbRegion,
     key: &[u8],
 ) -> Result<()> {
+    if key.len() != 32 {
+        return Err(PenumbraError::InvalidRpmbKeyLength.into());
+    }
+
     let key_hex = hex::encode(key);
-    xmlcmd_e!(xml, port, ExtRpmbInit, region as u32, key_hex)
+    xmlcmd_e!(xml, port, ExtRpmbInit, region as u32, key_hex)?;
+    xml.rpmb_authenticated_regions |= 1 << (region as u8);
+    Ok(())
 }

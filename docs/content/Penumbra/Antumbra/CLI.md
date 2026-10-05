@@ -6,6 +6,35 @@ You'll need a [[Download Agent]] to be able to interact with the device.
 If the device has DAA, you'll need the specific DA for your device.
 If the device has SLA, you'll probably either need an engineering preloader or paid auth.
 
+For Xiaomi devices that require a one-time BROM challenge, provide the matching AUTH file and
+pass `--mi-auth` in CLI mode. Antumbra prints the `AgAA` BLOB in Base64 and hex and waits for
+the 256-byte SIGN in either encoding. Connect the device in fresh BROM mode for each attempt.
+
+```sh
+antumbra --da DA.bin --auth auth_sv5.auth --mi-auth rpmb info
+```
+
+## RPMB
+
+RPMB commands require DA extensions. `info` reports available regions and capacities;
+`read` and `write` operate on 256-byte sectors. UFS devices may expose regions 0 through 3,
+while eMMC uses region 0.
+
+```sh
+antumbra --da DA.bin rpmb info
+antumbra --da DA.bin rpmb read --region 0 --start-sector 0 --num-sectors 1 rpmb.bin
+antumbra --da DA.bin rpmb verify-derived --region 0
+antumbra --da DA.bin rpmb write --region 0 --start-sector 0 --num-sectors 1 --key <64-hex-character-key> rpmb.bin
+```
+
+If `--num-sectors` is omitted, a read or write uses the remaining reported capacity. If the
+device does not report capacity, specify `--num-sectors` explicitly. `write --key` and `auth`
+accept a 32-byte key encoded as 64 hex characters.
+
+`rpmb erase --region 0` writes zeroes to the entire region after authenticating the derived key.
+`rpmb erase --all-regions` processes all reported regions. Erase is irreversible and has no
+readback verification; it does not reset OTP keys or write counters.
+
 ## List all partitions
 
 ```sh
