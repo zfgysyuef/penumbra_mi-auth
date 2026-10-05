@@ -35,6 +35,20 @@ accept a 32-byte key encoded as 64 hex characters.
 `rpmb erase --all-regions` processes all reported regions. Erase is irreversible and has no
 readback verification; it does not reset OTP keys or write counters.
 
+## UFS firmware update (FFU)
+
+Use `ufs-ffu` (alias `ffu`) with a raw UFS firmware image intended for the connected device.
+The device must have UFS storage and an XML/V6 Download Agent that supports
+`CMD:DEBUG:UFS` / `UPDATE-FIRMWARE`.
+
+```sh
+antumbra --da DA.bin ufs-ffu ufs_firmware.bin
+```
+
+The command streams the image to the DA and waits for its completion result. Afterward,
+reconnect the device and verify its UFS firmware version using your device's diagnostics;
+the DA result alone does not provide independent version verification.
+
 ## List all partitions
 
 ```sh

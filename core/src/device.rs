@@ -546,6 +546,31 @@ impl<'a, P: MtkPort> Device<'a, P> {
         protocol.get_storage(&mut self.port).cloned()
     }
 
+    /// Sends a UFS field firmware update (FFU) image through an XML/V6 DA.
+    /// The DA must support `CMD:DEBUG:UFS` with `UPDATE-FIRMWARE`. A successful
+    /// return means the DA acknowledged completion; it does not verify the new
+    /// UFS firmware version after reconnecting the device.
+    pub fn update_ufs_firmware<R, F>(&mut self, size: usize, reader: R, progress: F) -> Result<()>
+    where
+        R: Reader,
+        F: ProgressCallback,
+    {
+        if size == 0 {
+            return Err(PenumbraError::EmptyUfsFirmwareImage.into());
+        }
+
+        self.ensure_da_mode()?;
+        let storage = self.get_storage().ok_or(PenumbraError::UnsupportedStorage)?;
+        if storage.kind() != StorageType::Ufs {
+            return Err(PenumbraError::UnsupportedStorage.into());
+        }
+
+        self.with_protocol(|protocol, port| match protocol {
+            DaProtocol::V6(xml) => xml.update_ufs_firmware(port, size, reader, progress),
+            DaProtocol::V5(_) => Err(PenumbraError::WrongProtocolVersion.into()),
+        })
+    }
+
     /// Returns a reference to the DevInfo struct, containing information about
     /// the chip, efuses and more, fetched during the device life cycle.
     pub const fn devinfo(&self) -> &DevInfo {

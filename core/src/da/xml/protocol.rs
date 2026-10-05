@@ -29,6 +29,7 @@ use crate::da::xml::cmd::{
     NotifyInitHw,
     SetHostInfo,
     SetRuntimeParameter,
+    UfsUpdateFirmware,
     XmlCmdLifetime,
     XmlCommand,
     create_cmd,
@@ -93,6 +94,24 @@ use crate::{
     VERSION,
     exploit,
 };
+
+// A UFS controller can spend substantially longer programming firmware than a
+// normal DA command spends transferring a packet.
+const UFS_FFU_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const UFS_FFU_MAX_PACKET_LENGTH: usize = 16 * 1024 * 1024;
+
+fn check_ufs_ffu_end(resp: &str) -> Result<()> {
+    let result =
+        get_tag::<String>(resp, "arg/result").or_else(|_| get_tag::<String>(resp, "result"))?;
+    if result.trim() == "OK" {
+        return Ok(());
+    }
+
+    let message = get_tag::<String>(resp, "arg/message")
+        .or_else(|_| get_tag::<String>(resp, "message"))
+        .unwrap_or_else(|_| result.clone());
+    Err(XmlErrorKind::Other(format!("UFS firmware update failed: {message}")).into())
+}
 
 pub struct Xml {
     pub(super) write_packed_length: Option<usize>,
@@ -330,6 +349,95 @@ impl Xml {
         Ok(String::from_utf8_lossy(&buffer).into_owned())
     }
 
+    /// Streams a UFS firmware image to an XML/V6 DA and waits for its final result.
+    pub(crate) fn update_ufs_firmware<R: Reader, F: ProgressCallback, P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        size: usize,
+        mut reader: R,
+        mut progress: F,
+    ) -> Result<()> {
+        self.send_cmd(port, &UfsUpdateFirmware::new(size))?;
+
+        let previous_timeout = port.get_timeout();
+        let result = (|| -> Result<()> {
+            let mut sent_image = false;
+            loop {
+                port.set_timeout(UFS_FFU_IDLE_TIMEOUT)?;
+                let resp = self.read_data(port)?;
+                let response = String::from_utf8_lossy(&resp);
+
+                if memmem::find(&resp, CMD_END).is_some() {
+                    let result = check_ufs_ffu_end(&response);
+                    self.ack(port, None)?;
+                    result?;
+                    if !sent_image {
+                        return Err(XmlErrorKind::Other(
+                            "DA ended UFS firmware update without requesting the image".into(),
+                        )
+                        .into());
+                    }
+                    return Ok(());
+                }
+
+                let command: String = get_tag(&response, "command")?;
+                match command.as_str() {
+                    CMD_DOWNLOAD_FILE if !sent_image => {
+                        let packet_length = get_tag_usize(&response, "arg/packet_length")?;
+                        if packet_length == 0 || packet_length > UFS_FFU_MAX_PACKET_LENGTH {
+                            return Err(ProtocolError::InvalidPacketLength.into());
+                        }
+                        let sent = self.process_download_data(
+                            port,
+                            &response,
+                            size,
+                            MAX_TIMEOUT,
+                            &mut reader,
+                            &mut progress,
+                        )?;
+                        if sent != size {
+                            return Err(ProtocolError::InvalidResponseLength.into());
+                        }
+                        sent_image = true;
+                        info!("UFS firmware image transferred; waiting for DA completion...");
+                    }
+                    CMD_PROGRESS_REPORT => {
+                        self.process_progress_report_with_timeout(
+                            port,
+                            &response,
+                            UFS_FFU_IDLE_TIMEOUT,
+                            NOOP_PROGRESS,
+                        )?;
+                    }
+                    CMD_FILE_SYSTEM_OP => {
+                        let key: String = get_tag(&response, "arg/key")?;
+                        let operation = match key.as_str() {
+                            "FILE-SIZE" => FileSystemOp::FileSize(size),
+                            "EXISTS" => FileSystemOp::ExistsPresent,
+                            _ => {
+                                return Err(XmlErrorKind::Other(format!(
+                                    "Unexpected UFS firmware file operation: {key}"
+                                ))
+                                .into());
+                            }
+                        };
+                        self.process_file_sys_op(port, &response, operation)?;
+                    }
+                    _ => {
+                        return Err(XmlErrorKind::Other(format!(
+                            "Unexpected UFS firmware update command: {command}"
+                        ))
+                        .into());
+                    }
+                }
+            }
+        })();
+
+        let restore = port.set_timeout(previous_timeout);
+        result?;
+        restore
+    }
+
     /// Perform a (fake) file system operation
     /// This is used in SPFT for asking the tool to do stuff like creating directories,
     /// checking file existence, etc.
@@ -361,7 +469,7 @@ impl Xml {
         debug!("Received file system operation command: {cmd}");
 
         self.ack(port, None)?;
-        self.send(port, format!("OK@{}\0", op.default()).as_bytes())
+        self.send(port, format!("OK@{}\0", op.default().trim_end_matches('\0')).as_bytes())
     }
 
     pub(super) fn process_download_data<R: Reader, F: ProgressCallback, P: MtkPort>(
@@ -525,6 +633,16 @@ impl Xml {
         &mut self,
         port: &mut P,
         resp: &str,
+        progress: F,
+    ) -> Result<()> {
+        self.process_progress_report_with_timeout(port, resp, MAX_TIMEOUT, progress)
+    }
+
+    pub(super) fn process_progress_report_with_timeout<F: ProgressCallback, P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        resp: &str,
+        timeout: Duration,
         mut progress: F,
     ) -> Result<()> {
         let cmd: String = get_tag(resp, "command")?;
@@ -546,7 +664,7 @@ impl Xml {
         // Progress report might make the device delay a bit during USB
         // transfers. As a solution, we increase the port timeout
         // while we're waiting for the progress report, and restore it afterwards.
-        port.set_timeout(MAX_TIMEOUT)?;
+        port.set_timeout(timeout)?;
 
         let mut resp: Vec<u8> = Vec::new();
 
@@ -1225,5 +1343,149 @@ impl DownloadProtocolExt for Xml {
 
     fn patch_da2(&mut self, da: &mut DaEntry) -> Result<()> {
         patch::patch_da2(da)
+    }
+}
+
+#[cfg(test)]
+mod ffu_tests {
+    use std::io::{Cursor, Read};
+
+    use super::*;
+    use crate::port::ConnectionType;
+
+    struct ScriptedPort {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+        timeout: Duration,
+    }
+
+    impl ScriptedPort {
+        fn new(messages: &[&[u8]]) -> Self {
+            let mut input = Vec::new();
+            for message in messages {
+                input.extend_from_slice(&PacketHeader::flow(message.len() as u32).to_bytes());
+                input.extend_from_slice(message);
+            }
+            Self { input: Cursor::new(input), output: Vec::new(), timeout: MIN_TIMEOUT }
+        }
+    }
+
+    impl MtkPort for ScriptedPort {
+        fn open(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn reenumerate(&mut self, _: u16, _: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize> {
+            Read::read_exact(&mut self.input, buf)?;
+            Ok(buf.len())
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+            self.output.extend_from_slice(buf);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_baudrate(&self) -> u32 {
+            0
+        }
+
+        fn get_port_name(&self) -> String {
+            "scripted".into()
+        }
+
+        fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
+            self.timeout = timeout;
+            Ok(())
+        }
+
+        fn get_timeout(&self) -> Duration {
+            self.timeout
+        }
+
+        fn connection_type(&self) -> ConnectionType {
+            ConnectionType::Da
+        }
+
+        fn set_connection_type(&mut self, _: ConnectionType) -> Result<()> {
+            Ok(())
+        }
+
+        fn ctrl_out(&mut self, _: u8, _: u8, _: u16, _: u16, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+
+        fn ctrl_in(&mut self, _: u8, _: u8, _: u16, _: u16, _: usize) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+    }
+
+    fn xml() -> Xml {
+        Xml::new(DaProtocolParams {
+            devinfo: DevInfo::default(),
+            device_log: DeviceLog::default(),
+            activity: DeviceActivity::default(),
+            log_level: DaLogLevel::Info,
+            usb_log_channel: false,
+            preloader: None,
+        })
+    }
+
+    #[test]
+    fn accepts_only_successful_ufs_ffu_completion() {
+        let ok = "<da><command>CMD:END</command><arg><result>OK</result></arg></da>";
+        let rejected = "<da><command>CMD:END</command><arg><result>ERR</result><message>Bad image</message></arg></da>";
+        assert!(check_ufs_ffu_end(ok).is_ok());
+        assert!(check_ufs_ffu_end(rejected).unwrap_err().to_string().contains("Bad image"));
+    }
+
+    #[test]
+    fn streams_image_and_waits_for_da_success() {
+        let image = [0xDE, 0xAD, 0xBE, 0xEF];
+        let mut port = ScriptedPort::new(&[
+            b"<da><command>CMD:START</command></da>",
+            b"OK\0",
+            b"<da><command>CMD:FILE-SYS-OPERATION</command><arg><key>FILE-SIZE</key></arg></da>",
+            b"<da><command>CMD:DOWNLOAD-FILE</command><arg><packet_length>0x4</packet_length></arg></da>",
+            b"OK\0",
+            b"OK\0",
+            b"OK\0",
+            b"<da><command>CMD:END</command><arg><result>OK</result></arg></da>",
+        ]);
+
+        xml()
+            .update_ufs_firmware(&mut port, image.len(), Cursor::new(image), NOOP_PROGRESS)
+            .unwrap();
+
+        assert_eq!(port.timeout, MIN_TIMEOUT);
+        assert_eq!(port.input.position() as usize, port.input.get_ref().len());
+        assert_eq!(port.output.windows(image.len()).filter(|bytes| *bytes == image).count(), 1);
+        assert!(port.output.windows(b"OK@0x4\0".len()).any(|bytes| bytes == b"OK@0x4\0"));
+    }
+
+    #[test]
+    fn rejects_da_completion_without_image_transfer() {
+        let mut port = ScriptedPort::new(&[
+            b"<da><command>CMD:START</command></da>",
+            b"OK\0",
+            b"<da><command>CMD:END</command><arg><result>OK</result></arg></da>",
+        ]);
+
+        let error = xml()
+            .update_ufs_firmware(&mut port, 4, Cursor::new([1, 2, 3, 4]), NOOP_PROGRESS)
+            .unwrap_err();
+        assert!(error.to_string().contains("without requesting the image"));
+        assert_eq!(port.timeout, MIN_TIMEOUT);
     }
 }

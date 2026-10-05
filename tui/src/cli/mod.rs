@@ -148,6 +148,7 @@ cli_commands! {
         Peek32(Peek32Args),
         Poke32(Poke32Args),
         Rpmb(RpmbArgs),
+        UfsFfu(UfsFfuArgs),
         Shutdown(ShutdownArgs),
         Reboot(RebootArgs),
         XFlash(XFlashArgs),
@@ -208,5 +209,13 @@ mod tests {
             panic!("expected verify-derived command");
         };
         assert_eq!(verify.region, 1);
+    }
+
+    #[test]
+    fn parses_ufs_ffu_command_and_alias() {
+        for name in ["ufs-ffu", "ffu"] {
+            let args = CliArgs::try_parse_from(["antumbra", name, "firmware.bin"]).unwrap();
+            assert!(matches!(args.command, Some(Commands::UfsFfu(_))));
+        }
     }
 }

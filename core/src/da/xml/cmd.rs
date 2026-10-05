@@ -20,6 +20,7 @@ pub const CMD_FILE_SYSTEM_OP: &str = "CMD:FILE-SYS-OPERATION";
 pub enum FileSystemOp {
     MkDir,
     Exists,
+    ExistsPresent,
     FileSize(usize),
     RemoveAll,
     Remove,
@@ -30,6 +31,7 @@ impl FileSystemOp {
         match self {
             Self::MkDir => "MKDIR\u{0}".to_string(),
             Self::Exists => "NOT-EXISTS\u{0}".to_string(), // To avoid more reads
+            Self::ExistsPresent => "EXISTS\u{0}".to_string(),
             Self::FileSize(size) => format!("0x{:X}\u{0}", size),
             Self::RemoveAll => "REMOVE-ALL\u{0}".to_string(),
             Self::Remove => "REMOVE\u{0}".to_string(),
@@ -258,6 +260,18 @@ pub struct FlashUpdate {
     backup_folder: &'static str,
 }
 
+/// SP Flash Tool V6 UFS field firmware update (FFU).
+#[derive(XmlCommand)]
+#[xmlcmd(name = "DEBUG:UFS")]
+pub struct UfsUpdateFirmware {
+    #[xml(tag = "function", value = "UPDATE-FIRMWARE")]
+    function: &'static str,
+    // The source can also be a local path in SP Flash Tool. A memory descriptor
+    // lets Penumbra stream the caller's reader through CMD:DOWNLOAD-FILE.
+    #[xml(tag = "source_file", fmt = "MEM://0x0:0x{size:X}")]
+    size: usize,
+}
+
 pub fn create_cmd<C: XmlCommand>(cmd: &C) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="utf-8"?><da><version>{}</version><command>CMD:{}</command>"#,
@@ -292,4 +306,18 @@ pub fn create_cmd<C: XmlCommand>(cmd: &C) -> String {
 
     xml.push_str("</da>\u{0}");
     xml
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ufs_ffu_command_matches_sp_flash_tool_v6_shape() {
+        let cmd = create_cmd(&UfsUpdateFirmware::new(0x1234usize));
+        assert!(cmd.contains("<version>1.0</version>"));
+        assert!(cmd.contains("<command>CMD:DEBUG:UFS</command>"));
+        assert!(cmd.contains("<function>UPDATE-FIRMWARE</function>"));
+        assert!(cmd.contains("<source_file>MEM://0x0:0x1234</source_file>"));
+    }
 }

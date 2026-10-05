@@ -174,6 +174,8 @@ pub enum PenumbraError {
     PartitionNotFound(String),
     #[error("Unsupported storage type")]
     UnsupportedStorage,
+    #[error("UFS firmware image must not be empty")]
+    EmptyUfsFirmwareImage,
     #[error("Invalid RPMB region")]
     InvalidRpmbRegion,
     #[error("RPMB key must be exactly 32 bytes")]
